@@ -1,4 +1,14 @@
-import { getModelById, getVideoModelById, getI2IModelById, getI2VModelById, getV2VModelById, getRecastModelById, getLipSyncModelById, getAudioModelById } from './models.js';
+import { getModelById, getVideoModelById, getI2IModelById, getI2VModelById, getV2VModelById, getRecastModelById, getLipSyncModelById, getAudioModelById, getMotionControlModelById } from './models.js';
+import {
+    buildVideoToolPayload,
+    serializeVideoToolOptions,
+} from './videoToolCapabilities.js';
+import { buildImageSizePayload } from './imageSizing.js';
+import { buildImageInputPayload, getImageInputValidationError, normalizePrimaryImageUrls } from './imageInputContracts.js';
+import { pollForGenerationResult } from './utils/generationLifecycle.js';
+import { getModelMediaCapabilities, mapReferenceParams } from './modelCapabilities.js';
+import { buildSupplementalInputPayload } from './modelParameters.js';
+import { getGroupedVideoConfiguration } from './groupedVideoModels.js';
 
 // In an http(s) browser we route through the host app's proxy (Next.js routes
 // under /api/* re-issue the call server-side) so api.muapi.ai CORS is bypassed.
@@ -7,6 +17,8 @@ const BASE_URL = (typeof window !== 'undefined' && window.location?.protocol?.st
     ? '/api'
     : 'https://api.muapi.ai';
 const PROXY_WF_BASE = '/api/workflow';
+const FILE_UPLOAD_TIMEOUT_MS = 300_000;
+const FILE_UPLOAD_PENDING_PROGRESS = 99;
 
 function notifyAuthRequired(status, detail) {
     if (typeof window === 'undefined') return;
@@ -14,29 +26,39 @@ function notifyAuthRequired(status, detail) {
     window.dispatchEvent(new CustomEvent('muapi:auth-required', { detail: { status, message: detail } }));
 }
 
-async function pollForResult(requestId, key, maxAttempts = 900, interval = 2000) {
-    const pollUrl = `${BASE_URL}/api/v1/predictions/${requestId}/result`;
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        await new Promise(resolve => setTimeout(resolve, interval));
-        try {
-            const response = await fetch(pollUrl, {
-                headers: { 'Content-Type': 'application/json', 'x-api-key': key }
-            });
-            if (!response.ok) {
-                const errText = await response.text();
-                if (response.status >= 500) continue;
-                notifyAuthRequired(response.status, errText);
-                throw new Error(`Poll Failed: ${response.status} - ${errText.slice(0, 100)}`);
-            }
-            const data = await response.json();
-            const status = data.status?.toLowerCase();
-            if (status === 'completed' || status === 'succeeded' || status === 'success') return data;
-            if (status === 'failed' || status === 'error') throw new Error(`Generation failed: ${data.error || 'Unknown error'}`);
-        } catch (error) {
-            if (attempt === maxAttempts) throw error;
-        }
+function assertRequiredPrompt(model, params) {
+    if (model?.promptRequired && !String(params.prompt || '').trim()) {
+        throw new Error('Prompt is required for this model.');
     }
-    throw new Error('Generation timed out after polling.');
+}
+
+function includeRequiredArrayDefaults(model, payload) {
+    const defaults = {};
+    for (const field of model?.required || []) {
+        if (payload[field] !== undefined || model?.inputs?.[field]?.type !== 'array') continue;
+        defaults[field] = [];
+    }
+    return Object.keys(defaults).length > 0 ? { ...defaults, ...payload } : payload;
+}
+
+async function pollForResult(requestId, key, maxAttempts = 900, interval = 2000) {
+    return pollForGenerationResult({
+        baseUrl: BASE_URL,
+        requestId,
+        apiKey: key,
+        maxAttempts,
+        interval,
+        onAuthRequired: notifyAuthRequired,
+    });
+}
+
+function normalizePredictionResult(submitData, result, outputUrl) {
+    const requestId = submitData?.request_id || submitData?.id || result?.request_id || result?.id;
+    return {
+        ...result,
+        ...(requestId ? { request_id: requestId } : {}),
+        url: outputUrl,
+    };
 }
 
 async function submitAndPoll(endpoint, payload, key, onRequestId, maxAttempts = 60) {
@@ -57,14 +79,18 @@ async function submitAndPoll(endpoint, payload, key, onRequestId, maxAttempts = 
     if (onRequestId) onRequestId(requestId);
     const result = await pollForResult(requestId, key, maxAttempts);
     const outputUrl = result.outputs?.[0] || result.url || result.output?.url;
-    return { ...result, url: outputUrl };
+    return normalizePredictionResult(submitData, result, outputUrl);
 }
 
 export async function generateImage(apiKey, params) {
     const modelInfo = getModelById(params.model);
     const endpoint = modelInfo?.endpoint || params.model;
-    const payload = { prompt: params.prompt };
-    if (params.aspect_ratio) payload.aspect_ratio = params.aspect_ratio;
+    const payload = {
+        ...buildSupplementalInputPayload(modelInfo, params),
+        prompt: params.prompt
+    };
+    if (modelInfo) Object.assign(payload, buildImageSizePayload(modelInfo, params.aspect_ratio));
+    else if (params.aspect_ratio) payload.aspect_ratio = params.aspect_ratio;
     if (params.resolution) payload.resolution = params.resolution;
     if (params.quality) payload.quality = params.quality;
     if (params.image_url) { 
@@ -82,18 +108,25 @@ export async function generateImage(apiKey, params) {
 export async function generateI2I(apiKey, params) {
     const modelInfo = getI2IModelById(params.model);
     const endpoint = modelInfo?.endpoint || params.model;
-    const payload = {};
-    if (params.prompt) payload.prompt = params.prompt;
     const imageField = modelInfo?.imageField || 'image_url';
-    const imagesList = params.images_list?.length > 0 ? params.images_list : (params.image_url ? [params.image_url] : null);
-    if (imagesList) {
+    const imagesList = normalizePrimaryImageUrls(params.images_list, params.image_url);
+    const inputError = getImageInputValidationError(modelInfo, 'i2i', {
+        prompt: params.prompt,
+        primaryImageUrls: imagesList,
+        auxiliaryImageUrls: params,
+    });
+    if (inputError) throw new Error(inputError);
+    const payload = {
+        ...mapReferenceParams(modelInfo, params),
+        ...buildSupplementalInputPayload(modelInfo, params),
+        ...buildImageInputPayload(modelInfo, 'i2i', params)
+    };
+    if (imagesList.length > 0) {
         if (imageField === 'images_list') payload.images_list = imagesList;
         else payload[imageField] = imagesList[0];
     }
-    if (modelInfo?.swapField && params.swap_url) {
-        payload[modelInfo.swapField] = params.swap_url;
-    }
-    if (params.aspect_ratio) payload.aspect_ratio = params.aspect_ratio;
+    if (modelInfo) Object.assign(payload, buildImageSizePayload(modelInfo, params.aspect_ratio));
+    else if (params.aspect_ratio) payload.aspect_ratio = params.aspect_ratio;
     if (params.resolution) payload.resolution = params.resolution;
     if (params.quality) payload.quality = params.quality;
     if (modelInfo?.inputs?.name) {
@@ -119,56 +152,48 @@ export async function decomposeLayers(apiKey, params) {
 export async function generateVideo(apiKey, params) {
     const modelInfo = getVideoModelById(params.model);
     const endpoint = modelInfo?.endpoint || params.model;
-    const payload = {};
+    const mediaCapabilities = getModelMediaCapabilities(modelInfo);
+    assertRequiredPrompt(modelInfo, params);
+    let payload = {
+        ...mapReferenceParams(modelInfo, params),
+        ...buildSupplementalInputPayload(modelInfo, params)
+    };
     if (params.prompt) payload.prompt = params.prompt;
     if (params.request_id) payload.request_id = params.request_id;
     if (params.aspect_ratio) payload.aspect_ratio = params.aspect_ratio;
     if (params.duration) payload.duration = params.duration;
     if (params.resolution) payload.resolution = params.resolution;
+    if (typeof params.generate_audio === 'boolean') payload.generate_audio = params.generate_audio;
     if (params.quality) payload.quality = params.quality;
     if (params.mode) payload.mode = params.mode;
-    if (params.image_url) payload.image_url = params.image_url;
-    if (params.images_list?.length > 0) payload.images_list = params.images_list;
-    if (params.videos_list?.length > 0) payload.videos_list = params.videos_list;
+    if (!mediaCapabilities.image.field && params.image_url) payload.image_url = params.image_url;
+    if (!mediaCapabilities.image.field && params.images_list?.length > 0) payload.images_list = params.images_list;
+    if (!mediaCapabilities.video.field && params.videos_list?.length > 0) payload.videos_list = params.videos_list;
+    if (!mediaCapabilities.video.field && params.video_files?.length > 0) payload.video_files = params.video_files;
+    Object.assign(payload, serializeVideoToolOptions(modelInfo, params.options));
+    payload = includeRequiredArrayDefaults(modelInfo, payload);
     return submitAndPoll(endpoint, payload, apiKey, params.onRequestId, 900);
 }
 
 export async function generateI2V(apiKey, params) {
     const modelInfo = getI2VModelById(params.model);
     const endpoint = modelInfo?.endpoint || params.model;
-    const payload = {};
+    assertRequiredPrompt(modelInfo, params);
+    let payload = {
+        ...mapReferenceParams(modelInfo, params),
+        ...buildSupplementalInputPayload(modelInfo, params)
+    };
     if (params.prompt) payload.prompt = params.prompt;
-    const imageField = modelInfo?.imageField || 'image_url';
-    const imageInput = modelInfo?.inputs?.[imageField];
-    const imageUrls = params.images_list?.length > 0
-        ? params.images_list
-        : (params.image_url ? [params.image_url] : []);
-    if (imageUrls.length > 0) {
-        if (imageInput?.type === 'array' || imageField === 'images_list') {
-            payload[imageField] = imageUrls;
-        } else {
-            payload[imageField] = imageUrls[0];
-        }
-    }
-    const lastImageField = modelInfo?.lastImageField;
-    if (lastImageField && params.last_image) {
-        if (lastImageField === 'images_list') {
-            if (!payload.images_list) payload.images_list = [];
-            if (payload.images_list.indexOf(params.last_image) === -1) {
-                payload.images_list.push(params.last_image);
-            }
-        } else {
-            payload[lastImageField] = params.last_image;
-        }
-    }
     if (params.aspect_ratio) payload.aspect_ratio = params.aspect_ratio;
     if (params.duration) payload.duration = params.duration;
     if (params.resolution) payload.resolution = params.resolution;
+    if (typeof params.generate_audio === 'boolean') payload.generate_audio = params.generate_audio;
     if (params.quality) payload.quality = params.quality;
     if (params.mode) payload.mode = params.mode;
     if (modelInfo?.inputs?.name) {
         payload.name = params.name || modelInfo.inputs.name.default;
     }
+    payload = includeRequiredArrayDefaults(modelInfo, payload);
     return submitAndPoll(endpoint, payload, apiKey, params.onRequestId, 900);
 }
 
@@ -187,15 +212,64 @@ export async function generateMarketingStudioAd(apiKey, params) {
 export async function processV2V(apiKey, params) {
     const modelInfo = getV2VModelById(params.model);
     const endpoint = modelInfo?.endpoint || params.model;
-    const videoField = modelInfo?.videoField || 'video_url';
-    const payload = { [videoField]: params.video_url };
-    if (modelInfo?.imageField && params.image_url) {
-        payload[modelInfo.imageField] = params.image_url;
-    }
+    const toolPayload = buildVideoToolPayload(modelInfo, params);
+    let payload = {
+        ...buildSupplementalInputPayload(modelInfo, params),
+        ...toolPayload,
+        ...mapReferenceParams(modelInfo, params),
+    };
     if (modelInfo?.hasPrompt && params.prompt) {
         payload.prompt = params.prompt;
     }
+    if (getGroupedVideoConfiguration(modelInfo?.id)) {
+        for (const field of ['duration', 'aspect_ratio', 'resolution', 'quality']) {
+            if (modelInfo.inputs?.[field] && params[field] !== undefined) {
+                payload[field] = params[field];
+            }
+        }
+    }
+    payload = includeRequiredArrayDefaults(modelInfo, payload);
     return submitAndPoll(endpoint, payload, apiKey, params.onRequestId, 900);
+}
+
+export async function estimateV2VCost(params, signal) {
+    const modelInfo = getV2VModelById(params?.model);
+    const endpoint = modelInfo?.endpoint || params?.model;
+    if (!endpoint) {
+        throw new Error('A V2V model is required to estimate cost.');
+    }
+
+    const payload = buildVideoToolPayload(modelInfo, params);
+    const response = await fetch(`${BASE_URL}/api/v1/models/${endpoint}/estimate-cost`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal,
+    });
+
+    if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(`Cost estimate failed: ${response.status} ${response.statusText} - ${errText.slice(0, 100)}`);
+    }
+
+    let data;
+    try {
+        data = await response.json();
+    } catch {
+        throw new Error('Cost estimate returned invalid JSON.');
+    }
+
+    if (typeof data?.cost !== 'number' || !Number.isFinite(data.cost) || data.cost < 0) {
+        throw new Error('Cost estimate returned an invalid cost.');
+    }
+    if (typeof data.currency !== 'string' || !/^[A-Za-z]{3}$/.test(data.currency.trim())) {
+        throw new Error('Cost estimate returned an invalid currency.');
+    }
+
+    return {
+        cost: data.cost,
+        currency: data.currency.trim().toUpperCase(),
+    };
 }
 
 export async function processRecast(apiKey, params) {
@@ -216,6 +290,53 @@ export async function processRecast(apiKey, params) {
         payload.character_orientation = params.character_orientation;
     }
     return submitAndPoll(endpoint, payload, apiKey, params.onRequestId, 900);
+}
+
+export async function processMotionControl(apiKey, params) {
+    const model = params.model || 'seedance-2.5-motion-control';
+    const mode = params.mode || 'motion_transfer';
+    const internalPrompt = mode === 'objects_swap'
+        ? "Keep the rest of the scene as filmed, swap the characters, products, or clothes with the reference images."
+        : "Extract motion from the reference video and rebuild the scene with the new characters and assets, preserving the original motion, choreography, and camera movements.";
+
+    const userPrompt = String(params.prompt || '').trim();
+    const finalPrompt = userPrompt ? `${internalPrompt} ${userPrompt}` : internalPrompt;
+
+    let imagesList = [];
+    if (Array.isArray(params.images_list)) {
+        imagesList = params.images_list;
+    } else if (params.images) {
+        imagesList = Array.isArray(params.images) ? params.images : [params.images];
+    } else if (params.image_url) {
+        imagesList = [params.image_url];
+    }
+
+    let duration = Number(params.duration) || 5;
+
+    const payload = {
+        video_url: params.video_url,
+        images_list: imagesList,
+        aspect_ratio: params.aspect_ratio || '16:9',
+        duration: duration,
+        generate_audio: !!params.generate_audio,
+        prompt: finalPrompt
+    };
+
+    if (model === 'seedance-2-motion-control') {
+        if (payload.duration > 15) payload.duration = 15;
+        if (payload.duration < 4) payload.duration = 4;
+        if (payload.images_list.length > 9) payload.images_list = payload.images_list.slice(0, 9);
+        payload.quality = params.quality === 'basic' ? 'basic' : 'high';
+        if (params.seed !== undefined && params.seed !== -1) payload.seed = Number(params.seed);
+    } else {
+        if (payload.duration > 30) payload.duration = 30;
+        if (payload.duration < 4) payload.duration = 4;
+        if (payload.images_list.length > 30) payload.images_list = payload.images_list.slice(0, 30);
+        payload.high_bitrate = !!params.high_bitrate;
+        if (params.seed !== undefined && params.seed !== -1) payload.seed = Number(params.seed);
+    }
+
+    return submitAndPoll(model, payload, apiKey, params.onRequestId, 900);
 }
 
 export async function processLipSync(apiKey, params) {
@@ -254,11 +375,15 @@ export function uploadFile(apiKey, file, onProgress) {
         const xhr = new XMLHttpRequest();
         xhr.open('POST', url);
         xhr.setRequestHeader('x-api-key', apiKey);
+        xhr.timeout = FILE_UPLOAD_TIMEOUT_MS;
 
         if (onProgress) {
             xhr.upload.onprogress = (event) => {
                 if (event.lengthComputable) {
-                    const percentComplete = Math.round((event.loaded / event.total) * 100);
+                    const percentComplete = Math.min(
+                        Math.round((event.loaded / event.total) * 100),
+                        FILE_UPLOAD_PENDING_PROGRESS
+                    );
                     onProgress(percentComplete);
                 }
             };
@@ -272,6 +397,7 @@ export function uploadFile(apiKey, file, onProgress) {
                     if (!fileUrl) {
                         reject(new Error('No URL returned from file upload'));
                     } else {
+                        onProgress?.(100);
                         resolve(fileUrl);
                     }
                 } catch (e) {
@@ -291,6 +417,7 @@ export function uploadFile(apiKey, file, onProgress) {
         };
 
         xhr.onerror = () => reject(new Error('Network error during file upload'));
+        xhr.ontimeout = () => reject(new Error('File upload timed out. Please try again.'));
         xhr.send(formData);
     });
 }
@@ -916,5 +1043,3 @@ export async function expandImage(apiKey, { image_url, onRequestId }) {
     const payload = { image_url };
     return submitAndPoll(endpoint, payload, apiKey, onRequestId, 90);
 }
-
-

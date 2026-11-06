@@ -13,9 +13,10 @@
   ],
   "scripts": {
     "dev": "next dev",
+    "prebuild": "npm run build:agent",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint",
+    "lint": "eslint .",
     "build:studio": "npm run build -w studio",
     "build:workflow": "npm run build -w workflow-builder",
     "build:agent": "npm run build -w ai-agent",
